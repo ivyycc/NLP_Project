@@ -1,0 +1,7 @@
+numpy
+torch
+matplotlib
+scikit-learn
+seaborn
+umap-learn
+minisom

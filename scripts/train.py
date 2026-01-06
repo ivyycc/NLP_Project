@@ -1,0 +1,315 @@
+# This is the main training script for the WCST next-token prediction model using standard Transformer architecture.
+# It uses the model i made in the model.py file
+# This is our baseline model that trains
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from data_loader import WCST_Dataset
+from model import Transformer # Import the skeleton
+import os
+import json
+
+# --- 1. Hyperparameters and Configuration ---
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+LEARNING_RATE =  3e-4
+BATCH_SIZE = 64
+NUM_EPOCHS = 40
+VOCAB_SIZE = 70  # 64 cards + 4 categories + sep + eos
+D_MODEL = 256    
+NUM_LAYERS = 4
+HEADS = 8
+D_FF = 1024      # Forward expansion (4 * 256 = 1024)
+DROPOUT = 0.05
+MAX_LENGTH = 10  # Max length of a sequence
+
+# Primary setting: train full-sequence next-token prediction (autoregressive)
+# Optionally add a small weighted extra objective on the final token (AUX_WEIGHT)
+AUX_WEIGHT = 0.0  
+TIE_WEIGHTS = True # try weight tying between embedding and output layer to be efficient so the matrices are shared and thus less parameters trained
+BEST_MODEL_PATH = "transformer_wcst_best.pth"
+METRICS_PATH = "training_metrics.json"
+
+# Optimizer choices
+USE_ADAMW = True
+WEIGHT_DECAY = 1e-4
+
+def mask_generate(seq_len):
+    # Create an empty matrix of zeros and fill lower triangle with 1s 
+    mask = torch.zeros((seq_len, seq_len))
+    for i in range(seq_len):
+        for j in range(seq_len):
+            if j <= i:        # Allow only previous tokens (and self)
+                mask[i, j] = 1
+            else:
+                mask[i, j] = 0
+    mask = mask.bool()
+    return mask
+
+def _category_stats(preds, labels):
+    # preds, labels are token indices (64..67)
+    preds_c = preds - 64
+    labels_c = labels - 64
+    num_classes = 4
+    per_class_correct = torch.zeros(num_classes, dtype=torch.long, device=preds.device)
+    per_class_total = torch.zeros(num_classes, dtype=torch.long, device=preds.device)
+    for c in range(num_classes):
+        mask = (labels_c == c)
+        per_class_total[c] = mask.sum()
+        per_class_correct[c] = ((preds_c == c) & mask).sum()
+    return per_class_correct.cpu().tolist(), per_class_total.cpu().tolist()
+
+def main():
+    train_losses = []
+    val_losses = []
+    val_accuracies = []
+    
+    print("Loading data...")
+    train_dataset = WCST_Dataset("train_data.txt")
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    validation_dataset = WCST_Dataset("validation_clean.txt")
+    validation_loader = DataLoader(validation_dataset, batch_size=BATCH_SIZE)
+
+    # Quick sanity check on validation tokens to ensure dataset includes question/category
+    sample_inputs, sample_targets = next(iter(validation_loader))
+    category_tokens = sample_targets[:, -1]  # expected to be category token in 64..67
+    uniq, counts = torch.unique(category_tokens, return_counts=True)
+    print("Sanity check (validation batch): unique tokens at targets[:, -1]:")
+    for u, c in zip(uniq.tolist(), counts.tolist()):
+        print(f"  token {u}: {c} samples")
+    if not all(64 <= int(u) <= 67 for u in uniq):
+        print(" Warning: some targets[:, -1] are not category tokens in [64..67].")
+        print("   This usually means the saved data is missing the question/label portion. Regenerate data using the updated generate_data.py.")
+
+    # --- 3. Initialize Model, Optimizer, and Loss Function ---
+    print(f"Using device: {DEVICE}")
+    model = Transformer(
+        vocab_size=VOCAB_SIZE,
+        d_model=D_MODEL,           # Changed from embed_size
+        d_ff=D_FF,                 # Changed from forward_expansion
+        num_layers=NUM_LAYERS,
+        num_heads=HEADS,           # Changed from heads
+        dropout=DROPOUT
+    ).to(DEVICE)
+
+    # Optional weight tying (makes output layer share embedding weights)
+    if TIE_WEIGHTS:
+        try:
+            model.output_layer.weight = model.embedding.token_embedding.weight
+            print("Tied output_layer.weight to embedding.token_embedding.weight")
+        except Exception as e:
+            print("Weight tying unavailable:", e)
+
+    if USE_ADAMW:
+        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
+    criterion = nn.CrossEntropyLoss() # Use CrossEntropyLoss for classification
+
+    best_val_acc = -1.0
+    best_epoch = -1
+
+    # --- 4. Training Loop (full-sequence next-token objective) ---
+    print("Starting training...")
+    for epoch in range(NUM_EPOCHS):
+        model.train() # Set model to training mode
+        total_loss = 0.0
+        
+        for batch_idx, (inputs, targets) in enumerate(train_loader):
+            inputs = inputs.to(DEVICE)
+            targets = targets.to(DEVICE)
+            seq_len = inputs.size(1)
+            mask = mask_generate(seq_len).to(DEVICE)
+
+            outputs = model(inputs, mask, return_attention=False)  # [B, L, V]
+
+            # --- FULL-SEQUENCE NEXT-TOKEN LOSS (aligned with the brief) ---
+            outputs_reshaped = outputs.reshape(-1, outputs.shape[2])  # [B*L, V]
+            targets_reshaped = targets.reshape(-1)                    # [B*L]
+            loss_full = criterion(outputs_reshaped, targets_reshaped)
+
+            # Optional weighted extra final-token loss to emphasize category
+            logits_last = outputs[:, -1, :]       # [B, V]
+            labels_last = targets[:, -1]          # [B]
+            loss_last = criterion(logits_last, labels_last)
+
+            loss = loss_full + AUX_WEIGHT * loss_last
+
+            total_loss += loss.item()
+
+            optimizer.zero_grad()
+            loss.backward()
+
+            # inspect gradients for the first batch of epoch (debug)
+            if batch_idx == 0:
+                grads = [p.grad.norm().item() if p.grad is not None else float('nan') for p in list(model.parameters())[:8]]
+                print("Initial grad norms (sample):", grads)
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            if batch_idx % 100 == 0:
+                print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Batch [{batch_idx}/{len(train_loader)}], Loss(full+aux): {loss.item():.4f}")
+
+        # --- 5. Validation Step (compute same full-sequence CE) ---
+        model.eval()
+        total_val_loss_full = 0.0
+        total_val_loss_last = 0.0
+        correct_predictions = 0
+        total_predictions = 0
+        per_class_correct = [0, 0, 0, 0]
+        per_class_total = [0, 0, 0, 0]
+        mean_category_probs = torch.zeros(4, device=DEVICE)
+
+        with torch.no_grad():
+            for inputs, targets in validation_loader:
+                inputs = inputs.to(DEVICE)
+                targets = targets.to(DEVICE)
+                
+                seq_len = inputs.size(1)
+                mask = mask_generate(seq_len).to(DEVICE)
+                outputs = model(inputs, mask, return_attention=False)
+                
+                # Validation loss aligned with training: full-sequence CE
+                outputs_reshaped = outputs.reshape(-1, outputs.shape[2])
+                targets_reshaped = targets.reshape(-1)
+                val_loss_full = criterion(outputs_reshaped, targets_reshaped)
+                total_val_loss_full += val_loss_full.item()
+                
+                # Final-token (category-only) diagnostic loss and accuracy
+                logits_last = outputs[:, -1, :]
+                labels_last = targets[:, -1]
+                val_loss_last = criterion(logits_last, labels_last)
+                total_val_loss_last += val_loss_last.item()
+
+                _, predicted = torch.max(logits_last, 1)
+                correct_predictions += (predicted == labels_last).sum().item()
+                total_predictions += labels_last.size(0)
+
+                pc_corr, pc_total = _category_stats(predicted, labels_last)
+                per_class_correct = [sum(x) for x in zip(per_class_correct, pc_corr)]
+                per_class_total = [sum(x) for x in zip(per_class_total, pc_total)]
+
+                probs = torch.softmax(logits_last, dim=1)
+                cat_probs = probs[:, 64:68].mean(dim=0)
+                mean_category_probs += cat_probs
+
+        avg_train_loss = total_loss / len(train_loader) if len(train_loader) > 0 else 0
+        avg_val_loss_full = total_val_loss_full / len(validation_loader) if len(validation_loader) > 0 else 0
+        avg_val_loss_last = total_val_loss_last / len(validation_loader) if len(validation_loader) > 0 else 0
+        val_accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
+        mean_category_probs = (mean_category_probs / len(validation_loader)).cpu().tolist()
+
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}]")
+        print(f"  Train Loss (full+aux): {avg_train_loss:.4f}")
+        print(f"  Validation Loss (full-seq CE): {avg_val_loss_full:.4f}")
+        print(f"  Validation Loss (category-only): {avg_val_loss_last:.4f}, Validation Accuracy (category): {val_accuracy:.4f}")
+        print(f"  Mean predicted prob for category tokens [C1..C4]: {mean_category_probs}")
+        print(f"  Per-class correct/total: {list(zip(per_class_correct, per_class_total))}")
+        
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss_full)
+        val_accuracies.append(val_accuracy)
+
+
+        # Save best model by validation category accuracy
+        if val_accuracy > best_val_acc:
+            best_val_acc = val_accuracy
+            best_epoch = epoch + 1
+            torch.save(model.state_dict(), BEST_MODEL_PATH)
+            print(f"   New best validation accuracy. Saved best model to {BEST_MODEL_PATH} (epoch {best_epoch}, val_acc={best_val_acc:.4f})")
+
+    print("Training complete.")
+    print(f"Best validation accuracy: {best_val_acc:.4f} at epoch {best_epoch}")
+    
+    metrics = {
+    'train_losses': train_losses,
+    'val_losses': val_losses,
+    'val_accuracies': val_accuracies,
+    'best_val_accuracy': best_val_acc,
+    'best_epoch': best_epoch,
+    'hyperparameters': {
+        'learning_rate': LEARNING_RATE,
+        'batch_size': BATCH_SIZE,
+        'num_epochs': NUM_EPOCHS,
+        'd_model': D_MODEL,
+        'num_layers': NUM_LAYERS,
+        'num_heads': HEADS,
+        'd_ff': D_FF,
+        'dropout': DROPOUT,
+        'aux_weight': AUX_WEIGHT,
+        'optimizer': 'AdamW' if USE_ADAMW else 'Adam',
+        'weight_decay': WEIGHT_DECAY
+        }
+    }
+
+    # ##################################################### TEST MODEL ####################################################
+    # Load best model checkpoint for final evaluation 
+    if os.path.exists(BEST_MODEL_PATH):
+        print(f"Loading best model from {BEST_MODEL_PATH} for final test evaluation...")
+        model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE))
+        model.to(DEVICE)
+    else:
+        print("No best model file found, using current model for testing.")
+
+    def evaluate_test_set(model, criterion):
+        test_dataset = WCST_Dataset("test_clean.txt")
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+        
+        model.eval()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
+                seq_len = inputs.size(1)
+                mask = mask_generate(seq_len).to(DEVICE)
+                outputs = model(inputs, mask)
+                
+                # Full-sequence CE (same objective used during training)
+                output_reshaped = outputs.reshape(-1, outputs.shape[2])
+                targets_reshaped = targets.reshape(-1)
+                loss = criterion(output_reshaped, targets_reshaped)
+                total_loss += loss.item()
+                
+                # Accuracy (last token = category)
+                category_preds = outputs[:, -1, :]
+                category_targets = targets[:, -1]
+                _, predicted = torch.max(category_preds, 1)
+                correct += (predicted == category_targets).sum().item()
+                total += category_targets.size(0)
+        
+        test_loss = total_loss / len(test_loader) if len(test_loader) > 0 else 0
+        test_acc = correct / total if total > 0 else 0
+        
+        print(f"\n{'='*50}")
+        print(f"FINAL TEST SET EVALUATION")
+        print(f"{'='*50}")
+        print(f"Test Loss (full-sequence CE): {test_loss:.4f}")
+        print(f"Test Accuracy (category): {test_acc:.4f}")
+        print(f"{'='*50}\n")
+        
+        return test_loss, test_acc
+
+    test_loss, test_acc = evaluate_test_set(model, criterion)
+    print("Testing complete.")
+
+    metrics['test_loss'] = test_loss
+    metrics['test_accuracy'] = test_acc
+
+
+    with open(METRICS_PATH, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f" Saved training metrics to {METRICS_PATH}")
+
+    # Save the trained model
+    torch.save(model.state_dict(), "transformer_wcst.pth")
+    print("Model saved as 'transformer_wcst.pth' (current state)")
+
+if __name__ == "__main__":
+    main()

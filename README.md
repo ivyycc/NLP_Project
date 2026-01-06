@@ -13,6 +13,7 @@ The project includes:
 ---
 
 ## 1. Project Structure
+```
 .
 ├── data_loader.py          # Dataset and DataLoader for WCST sequences
 ├── leakage_checker.py      # script to check for data leakage
@@ -45,7 +46,7 @@ The project includes:
 │   │   └── (same structure as Baseline)
 │   └── comparison_summary.json
 
-
+```
 ---
 ## 3. Requirements
 
@@ -82,3 +83,4 @@ python evaluation_2.py
 Plots: Saved in evaluation_plots/, organized by baseline or feature-modified models.
 Summary JSON: comparison_summary.json contains key evaluation metrics across model variants.
 Model Weights: transformer_wcst.pth for future inference or analysis.
+

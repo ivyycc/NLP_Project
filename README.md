@@ -80,7 +80,8 @@ python evaluation_2.py
 
 ## 5. Outputs
 
-Plots: Saved in evaluation_plots/, organized by baseline or feature-modified models.
-Summary JSON: comparison_summary.json contains key evaluation metrics across model variants.
-Model Weights: transformer_wcst.pth for future inference or analysis.
+- Plots: Saved in evaluation_plots/, organized by baseline or feature-modified models.
+- Summary JSON: comparison_summary.json contains key evaluation metrics across model variants.
+- Model Weights: transformer_wcst.pth for future inference or analysis.
+
 
